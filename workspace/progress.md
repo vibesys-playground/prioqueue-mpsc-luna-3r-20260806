@@ -1,0 +1,34 @@
+# Progress
+
+## Round 1 plan
+
+- Active major: M1, sharded MPSC producer state with single-consumer arbitration.
+- Task: implement an MPSC fast path in `src/lib.rs` using producer-owned bounded heaps or
+  equivalent shards and consumer-side minimum arbitration, with atomic capacity accounting;
+  retain a correct fallback for non-MPSC configurations and preserve the ABI in `src/ffi.rs`.
+- Gate: correctness checker must pass copied-ownership, bounds, empty/full, and concurrent
+  linearizability checks; benchmark sanity must report valid `total_ops_per_sec`, with an
+  end-to-end throughput improvement over the current single-mutex baseline on the trusted MPSC
+  workload.
+- Rationale: the current implementation serializes every enqueue and dequeue on one mutex and
+  allocates every value, making producer lock contention the most direct structural bottleneck.
+## Round 1 — Orchestrator (plan)
+- **reasoning**: The baseline serializes every producer and consumer operation through one mutex and allocates each value independently. Sharding producer state while centralizing minimum arbitration targets the dominant MPSC contention without changing the ABI or correctness contract.
+
+### Task
+Implement the first M1 slice in src/lib.rs: add an MPSC-specific fast path with producer-owned bounded shards and consumer-side minimum-priority arbitration, plus atomic bounded-capacity accounting. Ensure enqueue/dequeue linearizability, copied values, exact priority ordering, and no lost or duplicated items; retain a correct fallback for non-MPSC configurations. Keep the existing C ABI unchanged.
+
+### Pass criteria
+All mandatory correctness checks pass, including ownership-copying, bounds, empty/full behavior, capacity enforcement, and concurrent MPSC linearizability. The trusted benchmark reports valid end-to-end total_ops_per_sec and improves on the current single-global-mutex baseline for the MPSC workload.
+
+## Round 1 — Implementer summary
+
+Implemented the MPSC fast path in `src/lib.rs` with one mutex-protected producer shard per producer, fixed-order consumer locking for a consistent minimum-priority snapshot, copied values, and atomic bounded-capacity admission. Non-MPSC configurations retain the original global-heap fallback and the C ABI in `src/ffi.rs` is unchanged. Added a direct MPSC bounded/global-priority unit test.
+
+Validation: debug and release Rust tests pass; native ABI probes pass for SPSC, MPSC, SPMC, and MPMC (including 257-byte values); the native MPSC benchmark reported 1,841,778 successful ops/s versus 292,325 ops/s for the bundled single-mutex reference in a 300ms run. The Go wrapper tests were unavailable because the environment's Go binary has no configured `GOROOT`.
+## Round 1 — Implementer (attempt 1)
+- **expected_behavior**: All Rust tests and native ABI probes pass; MPSC maintains bounded, linearizable, exact-priority dequeue behavior with no lost or duplicated items and benchmarks substantially faster than the mutex baseline.
+
+### Summary
+Implemented MPSC producer-owned shards with atomic capacity accounting, consumer-side minimum-priority arbitration, copied values, and preserved non-MPSC fallback/ABI. Added MPSC tests and recorded results in progress.md.
+
