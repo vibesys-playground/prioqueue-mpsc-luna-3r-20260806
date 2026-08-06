@@ -68,11 +68,12 @@ acceptance"); read it before parking or abandoning.
 
 ## Major
 
-- [in_progress] M1: Shard MPSC producer state and move arbitration to the single consumer
-  (round 1). Reduce contention from the global queue mutex while retaining exact
-  minimum-priority behavior and bounded accounting.
-- [todo] M2: Replace per-enqueue heap allocation with bounded reusable value storage.
-  Address allocator cost and cache churn, especially for the fixed-size benchmark payloads.
+- [done] M1: Shard MPSC producer state and move arbitration to the single consumer
+  (round 1). Reduced contention from the global queue mutex while retaining exact
+  minimum-priority behavior and bounded accounting; accepted and benchmark-validated.
+- [in_progress] M2: Replace per-enqueue heap allocation with bounded reusable value storage
+  (round 1). Recycle copied value buffers within producer shards to address allocator cost
+  and cache churn, especially for the fixed-size benchmark payloads.
 - [todo] M3: Tune the bounded-capacity and synchronization layout after M1/M2.
   Reduce atomics, false sharing, and scan overhead using benchmark evidence without weakening
   linearizability.

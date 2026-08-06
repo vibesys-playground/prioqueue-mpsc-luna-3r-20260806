@@ -83,3 +83,33 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 
+## Round 2 — Orchestrator (pre-round)
+- **need_profile**: False
+- **profile_focus**: 
+- **reasoning**: The next bottleneck is clear from code inspection: every dequeue locks all producer shards and scans them, creating an O(producer_count) consumer-side critical section. The recent benchmark already passed and showed substantial improvement, so profiling is not necessary before targeting this arbitration path.
+
+## Round 2 — Orchestrator (plan)
+- **Active major**: M2, bounded reusable value storage (round 1); M1 is done after its accepted correctness and end-to-end benchmark gain.
+- **Task**: Replace per-enqueue `Vec<u8>` allocation in the MPSC fast path with per-shard reusable buffers. Return a dequeued entry's owned buffer to its originating shard's pool and reuse it on later enqueues, while preserving copied ownership, arbitrary value sizes up to the configured limit, capacity accounting, priority ordering, and the unchanged C ABI. Keep the existing fallback path correct.
+- **Gate**: All mandatory accuracy and benchmark sanity checks pass; MPSC end-to-end `total_ops_per_sec` is valid and improves over the current candidate or at minimum shows a measurable reduction in allocation-related overhead without regressing the trusted MPSC throughput.
+- **Rationale**: The accepted M1 path still allocates and copies a fresh heap buffer for every successful enqueue. The benchmark's fixed value size makes buffer recycling a direct way to reduce allocator calls and cache churn.
+## Round 2 — Orchestrator (plan)
+- **reasoning**: M1 is accepted and materially improved throughput. The remaining direct hot-path cost is fresh value allocation on every successful enqueue; shard-local buffer recycling targets that cost while preserving the existing arbitration design.
+
+### Task
+Implement M2 in src/lib.rs: replace per-enqueue Vec<u8> allocation in the MPSC fast path with reusable per-shard value buffers. Return dequeued buffers to their originating shard pool and reuse them for later enqueues, preserving copied ownership, arbitrary configured value sizes, capacity accounting, priority ordering, linearizability, and the unchanged C ABI. Keep non-MPSC fallback behavior correct.
+
+### Pass criteria
+All accuracy checks and benchmark sanity checks pass. Repeated fixed-size MPSC operations reuse bounded shard-local value storage after warmup, with no ownership, capacity, ordering, or ABI regressions. End-to-end trusted MPSC total_ops_per_sec is valid and does not regress from the current candidate, with measurable throughput improvement preferred.
+
+## Round 2 — Implementer summary
+
+Implemented M2 in `src/lib.rs`: MPSC shards now maintain bounded reusable `Vec<u8>` pools. Enqueue takes a sufficiently sized buffer from its originating shard, copies the borrowed input into it, and allocates only on a pool miss; dequeue copies the value out and returns the entry buffer to that same shard. Pool eviction bounds storage for alternating value sizes, while the non-MPSC fallback and C ABI remain unchanged. Added tests covering reuse, changing sizes, and capacity-one pool bounds.
+
+Validation: Rust tests pass; the native ABI probe passes for a 32-item, 257-byte MPSC queue; exported ABI symbols remain present. A 1-second native MPSC benchmark measured 1,257,878 successful ops/s versus 654,240 ops/s for the bundled reference. The Go checker could not run because the environment's Go binary has no configured `GOROOT`.
+## Round 2 — Implementer (attempt 1)
+- **expected_behavior**: MPSC fixed-size operations reuse shard-local buffers after warmup while preserving ownership, capacity, priority ordering, linearizability, and ABI compatibility. Rust tests and native ABI probes pass; benchmark throughput improved over the reference.
+
+### Summary
+Implemented bounded per-shard reusable MPSC value buffers with dequeue recycling, variable-size handling, tests, and preserved fallback/ABI behavior.
+
