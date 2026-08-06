@@ -122,3 +122,12 @@ Validation: Rust tests pass (3 tests), including maximum-priority MPSC behavior;
 ### Summary
 Optimized MPSC synchronization and allocation paths, preserved M3 priority-only ordering and ABI, rebuilt priority-queue-candidate.so, and appended progress.md. Rust tests and native ABI probes pass; benchmark reached 2,133,316 ops/s.
 
+## Round 3 — Judge (attempt 2)
+- **verdict**: pass
+
+### Analysis
+The candidate builds successfully, Rust unit tests pass, the required shared library exists, and all required vspq ABI symbols are exported. Native probes pass for SPSC, MPSC, SPMC, and MPMC configurations, including copied ownership, non-word-aligned values, bounds, capacity, empty/full behavior, and concurrent dequeue validation. The MPSC implementation uses per-producer heaps with atomic bounded occupancy and consumer-side minimum-priority arbitration; values are copied before publication and lower numeric priorities are dequeued first. Three trusted-equivalent 2-second MPSC benchmarks produced 1.686M, 1.885M, and 1.574M successful ops/sec, giving a median of approximately 1.686M, above the round-1 baseline of 1.629M. The Go wrapper could not run because the available Go installation lacks a compatible GOROOT, but the trusted native runner and probes completed successfully.
+
+### Feedback
+
+
