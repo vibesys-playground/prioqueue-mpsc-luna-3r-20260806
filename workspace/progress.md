@@ -138,3 +138,38 @@ The candidate builds successfully, Rust unit tests pass, the required shared lib
 ### Output
 PASS - mpsc linearizable bounded priority queue (50 trials, approximately 24 ops/trial, 4P/1C, capacity=1024, value_size=8)
 
+## Round 3 — Framework benchmark (attempt 2)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario mpsc --repetitions 3`
+- **total_ops_per_sec**: 1814433.480667
+
+### Output
+Scenario: mpsc  Repetitions: 3  Median successful ops/s: 1814433
+  Samples: [1.187457036664e+06 3.212693594369e+06 1.814433480667e+06]
+Scenario: mpsc  Duration: 10.000s  Prod: 4  Cons: 1
+  Enqueued: 9072840  Full: 591957560  Dequeued: 9071836  Empty: 228
+  Successful: 18144676  Attempts: 610102464 (1814433 successful ops/s)
+
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON__
+[
+  {
+    "scenario": "mpsc",
+    "enqueued": 9072840,
+    "dropped": 591957560,
+    "dequeued": 9071836,
+    "empty": 228,
+    "attempts": 610102464,
+    "duration": 10.000188044,
+    "total_ops_per_sec": 1814433.480667,
+    "producers": 4,
+    "consumers": 1,
+    "repetitions": 3,
+    "total_ops_per_sec_samples": [
+      1187457.036664,
+      3212693.594369,
+      1814433.480667
+    ]
+  }
+]
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
