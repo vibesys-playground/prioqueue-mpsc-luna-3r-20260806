@@ -102,3 +102,12 @@ binary has no configured `GOROOT`.
 ### Summary
 Implemented M3 by removing sequence state and using priority-only heap/shard arbitration. Preserved locking, capacity accounting, copying, fallback behavior, and ABI. Tests and release build pass; rebuilt the shared library.
 
+## Round 3 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The candidate builds and Rust unit tests pass. The shared library exports all required ABI symbols, and the native ABI probe succeeds for MPSC configuration. Native benchmark runs also complete successfully across SPSC, MPSC, SPMC, and MPMC scenarios with valid counters. However, the trusted-equivalent MPSC workload (capacity 1024, value size 8, 4 producers, 1 consumer, 10-second runs) produced samples of 1,262,586, 1,187,945, and 1,536,668 total_ops_per_sec, with a median of 1,262,586. This is below the round-1 baseline of 1,628,775.93 total_ops_per_sec, so the performance criterion is not met. Go evaluator tests could not run because the available Go toolchain is incompatible/missing required configuration, but this does not affect the independently observed benchmark failure.
+
+### Feedback
+Improve trusted MPSC throughput to at least the round-1 baseline of 1,628,775.93 total_ops_per_sec under the exact 4-producer, 1-consumer, capacity-1024, value-size-8 workload. Profile the all-shard locking and per-operation heap/value allocation paths; reduce synchronization and allocation overhead while preserving copying, minimum-priority ordering, bounded capacity, and linearizability. Rebuild priority-queue-candidate.so and rerun the evaluator benchmark and accuracy gate.
+
