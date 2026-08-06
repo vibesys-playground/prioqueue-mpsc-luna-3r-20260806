@@ -4,7 +4,7 @@ mod ffi;
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 const ABI_VERSION: u32 = 1;
@@ -16,13 +16,12 @@ const STATUS_INTERNAL_ERROR: u32 = 4;
 
 struct Entry {
     priority: u64,
-    sequence: u64,
     value: Vec<u8>,
 }
 
 impl PartialEq for Entry {
     fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
+        self.priority == other.priority
     }
 }
 
@@ -36,22 +35,16 @@ impl PartialOrd for Entry {
 
 impl Ord for Entry {
     fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| other.sequence.cmp(&self.sequence))
+        other.priority.cmp(&self.priority)
     }
 }
 
 struct Values {
-    next_sequence: u64,
     heap: BinaryHeap<Entry>,
 }
 
 struct Shard {
     heap: BinaryHeap<Entry>,
-    // Recycled value storage owned by this producer shard.
-    buffers: Vec<Vec<u8>>,
 }
 
 struct MpscState {
@@ -59,7 +52,6 @@ struct MpscState {
     // Reservations are made before copying the caller's value.  They make
     // admission bounded without putting producers behind a common mutex.
     occupied: AtomicUsize,
-    next_sequence: AtomicU64,
     shards: Vec<Mutex<Shard>>,
 }
 
@@ -97,15 +89,11 @@ impl Queue {
                 let mut heap = BinaryHeap::new();
                 heap.try_reserve(1)
                     .map_err(|_| STATUS_INTERNAL_ERROR)?;
-                shards.push(Mutex::new(Shard {
-                    heap,
-                    buffers: Vec::new(),
-                }));
+                shards.push(Mutex::new(Shard { heap }));
             }
             Some(Arc::new(MpscState {
                 capacity,
                 occupied: AtomicUsize::new(0),
-                next_sequence: AtomicU64::new(0),
                 shards,
             }))
         } else {
@@ -118,7 +106,6 @@ impl Queue {
                 capacity,
                 max_value_size,
                 values: Mutex::new(Values {
-                    next_sequence: 0,
                     heap,
                 }),
                 mpsc,
@@ -171,13 +158,7 @@ impl Producer {
             return STATUS_INTERNAL_ERROR;
         }
         value.extend_from_slice(data);
-        let sequence = values.next_sequence;
-        values.next_sequence = values.next_sequence.wrapping_add(1);
-        values.heap.push(Entry {
-            priority,
-            sequence,
-            value,
-        });
+        values.heap.push(Entry { priority, value });
         STATUS_OK
     }
 
@@ -198,53 +179,21 @@ impl Producer {
             }
         }
 
-        let sequence = mpsc.next_sequence.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut value = Vec::new();
+        if value.try_reserve_exact(data.len()).is_err() {
+            mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
+            return STATUS_INTERNAL_ERROR;
+        }
+        value.extend_from_slice(data);
         let Ok(mut shard) = mpsc.shards[self.shard_id].lock() else {
             mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
             return STATUS_INTERNAL_ERROR;
         };
-
-        // Reuse a buffer large enough for this value.  Searching the pool
-        // keeps large buffers available when callers vary value sizes.
-        let buffer_index = shard
-            .buffers
-            .iter()
-            .position(|buffer| buffer.capacity() >= data.len());
-        let mut value = if let Some(index) = buffer_index {
-            shard.buffers.swap_remove(index)
-        } else {
-            // A too-small buffer is not useful for this operation.  Keep the
-            // pool bounded even when a capacity-one queue alternates sizes.
-            if shard.buffers.len() >= mpsc.capacity {
-                let discard_index = shard
-                    .buffers
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, buffer)| buffer.capacity())
-                    .map(|(index, _)| index)
-                    .expect("non-empty pool when at capacity");
-                shard.buffers.swap_remove(discard_index);
-            }
-            let mut value = Vec::new();
-            if value.try_reserve_exact(data.len()).is_err() {
-                mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
-                return STATUS_INTERNAL_ERROR;
-            }
-            value
-        };
-        value.clear();
-        value.extend_from_slice(data);
-
         if shard.heap.try_reserve(1).is_err() {
-            shard.buffers.push(value);
             mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
             return STATUS_INTERNAL_ERROR;
         }
-        shard.heap.push(Entry {
-            priority,
-            sequence,
-            value,
-        });
+        shard.heap.push(Entry { priority, value });
         STATUS_OK
     }
 }
@@ -288,11 +237,7 @@ impl Consumer {
             .iter()
             .enumerate()
             .filter_map(|(index, shard)| shard.heap.peek().map(|entry| (index, entry)))
-            .min_by(|(_, left), (_, right)| {
-                left.priority
-                    .cmp(&right.priority)
-                    .then_with(|| left.sequence.cmp(&right.sequence))
-            })
+            .min_by(|(_, left), (_, right)| left.priority.cmp(&right.priority))
         else {
             return Err(STATUS_EMPTY);
         };
@@ -301,11 +246,7 @@ impl Consumer {
         }
         output[..best.value.len()].copy_from_slice(&best.value);
         let length = best.value.len();
-        let entry = shards[best_index]
-            .heap
-            .pop()
-            .expect("peeked entry must remain in the locked shard");
-        shards[best_index].buffers.push(entry.value);
+        shards[best_index].heap.pop();
         mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
         Ok(length)
     }
@@ -373,41 +314,5 @@ mod tests {
                 .load(AtomicOrdering::Acquire),
             0
         );
-    }
-
-    #[test]
-    fn mpsc_reuses_buffers_and_handles_changing_value_sizes() {
-        let queue = Queue::new(4, 32, 2, 1).unwrap();
-        let producer = queue.producer(0).unwrap();
-        let consumer = queue.consumer(0).unwrap();
-        let mut output = [0_u8; 32];
-
-        for length in [3, 3, 17, 3, 32, 17, 3] {
-            let input = vec![length as u8; length];
-            assert_eq!(producer.try_enqueue(0, &input), STATUS_OK);
-            assert_eq!(consumer.try_dequeue(&mut output), Ok(length));
-            assert_eq!(&output[..length], input.as_slice());
-        }
-
-        let shard = queue.state.mpsc.as_ref().unwrap().shards[0]
-            .lock()
-            .unwrap();
-        // One reusable buffer is retained for each size class encountered;
-        // the pool remains bounded and the largest allocation is reusable.
-        assert_eq!(shard.buffers.len(), 3);
-        assert!(shard.buffers.iter().any(|buffer| buffer.capacity() >= 32));
-
-        let queue = Queue::new(1, 32, 2, 1).unwrap();
-        let producer = queue.producer(0).unwrap();
-        let consumer = queue.consumer(0).unwrap();
-        for length in 1..=32 {
-            let input = vec![length as u8; length];
-            assert_eq!(producer.try_enqueue(0, &input), STATUS_OK);
-            assert_eq!(consumer.try_dequeue(&mut output), Ok(length));
-        }
-        let shard = queue.state.mpsc.as_ref().unwrap().shards[0]
-            .lock()
-            .unwrap();
-        assert!(shard.buffers.len() <= 1);
     }
 }
