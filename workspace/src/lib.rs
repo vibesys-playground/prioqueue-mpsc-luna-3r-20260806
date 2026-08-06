@@ -4,7 +4,9 @@ mod ffi;
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::cell::UnsafeCell;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 const ABI_VERSION: u32 = 1;
@@ -13,10 +15,115 @@ const STATUS_FULL: u32 = 1;
 const STATUS_EMPTY: u32 = 2;
 const STATUS_INVALID: u32 = 3;
 const STATUS_INTERNAL_ERROR: u32 = 4;
+const INLINE_VALUE_SIZE: usize = 8;
+
+struct SpinMutex<T> {
+    locked: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for SpinMutex<T> {}
+unsafe impl<T: Send> Sync for SpinMutex<T> {}
+
+struct SpinGuard<'a, T> {
+    mutex: &'a SpinMutex<T>,
+}
+
+impl<T> SpinMutex<T> {
+    fn new(value: T) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    #[inline]
+    fn lock(&self) -> SpinGuard<'_, T> {
+        let mut spins = 0_u32;
+        loop {
+            if self
+                .locked
+                .compare_exchange_weak(false, true, AtomicOrdering::Acquire, AtomicOrdering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            if spins < 128 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                spins = 0;
+                std::thread::yield_now();
+            }
+        }
+        SpinGuard { mutex: self }
+    }
+}
+
+impl<T> Deref for SpinGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // The guard owns the lock, so the value cannot be accessed mutably by
+        // another thread while this reference is alive.
+        unsafe { &*self.mutex.value.get() }
+    }
+}
+
+impl<T> DerefMut for SpinGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.value.get() }
+    }
+}
+
+impl<T> Drop for SpinGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.locked.store(false, AtomicOrdering::Release);
+    }
+}
+
+enum Value {
+    Inline { len: u8, bytes: [u8; INLINE_VALUE_SIZE] },
+    Heap(Vec<u8>),
+}
+
+impl Value {
+    fn try_copy(data: &[u8]) -> Result<Self, ()> {
+        if data.len() <= INLINE_VALUE_SIZE {
+            let mut bytes = [0_u8; INLINE_VALUE_SIZE];
+            bytes[..data.len()].copy_from_slice(data);
+            Ok(Self::Inline {
+                len: data.len() as u8,
+                bytes,
+            })
+        } else {
+            let mut value = Vec::new();
+            value.try_reserve_exact(data.len()).map_err(|_| ())?;
+            value.extend_from_slice(data);
+            Ok(Self::Heap(value))
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len as usize,
+            Self::Heap(value) => value.len(),
+        }
+    }
+
+    #[inline]
+    fn copy_to(&self, output: &mut [u8]) {
+        match self {
+            Self::Inline { len, bytes } => output[..*len as usize].copy_from_slice(&bytes[..*len as usize]),
+            Self::Heap(value) => output[..value.len()].copy_from_slice(value),
+        }
+    }
+}
 
 struct Entry {
     priority: u64,
-    value: Vec<u8>,
+    value: Value,
 }
 
 impl PartialEq for Entry {
@@ -47,12 +154,18 @@ struct Shard {
     heap: BinaryHeap<Entry>,
 }
 
+struct MpscShard {
+    lock: SpinMutex<Shard>,
+    min_priority: AtomicU64,
+    has_item: AtomicBool,
+}
+
 struct MpscState {
     capacity: usize,
     // Reservations are made before copying the caller's value.  They make
     // admission bounded without putting producers behind a common mutex.
     occupied: AtomicUsize,
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<MpscShard>,
 }
 
 struct QueueState {
@@ -89,7 +202,11 @@ impl Queue {
                 let mut heap = BinaryHeap::new();
                 heap.try_reserve(1)
                     .map_err(|_| STATUS_INTERNAL_ERROR)?;
-                shards.push(Mutex::new(Shard { heap }));
+                shards.push(MpscShard {
+                    lock: SpinMutex::new(Shard { heap }),
+                    min_priority: AtomicU64::new(u64::MAX),
+                    has_item: AtomicBool::new(false),
+                });
             }
             Some(Arc::new(MpscState {
                 capacity,
@@ -153,47 +270,59 @@ impl Producer {
         if values.heap.len() == self.state.capacity {
             return STATUS_FULL;
         }
-        let mut value = Vec::new();
-        if value.try_reserve_exact(data.len()).is_err() {
+        let Ok(value) = Value::try_copy(data) else {
             return STATUS_INTERNAL_ERROR;
-        }
-        value.extend_from_slice(data);
+        };
         values.heap.push(Entry { priority, value });
         STATUS_OK
     }
 
     fn try_enqueue_mpsc(&self, mpsc: &MpscState, priority: u64, data: &[u8]) -> u32 {
-        let mut occupied = mpsc.occupied.load(AtomicOrdering::Acquire);
-        loop {
-            if occupied >= mpsc.capacity {
-                return STATUS_FULL;
+        // A fetch-add is cheaper than a reservation CAS in the contended
+        // full-queue benchmark. Temporary over-reservation is rolled back;
+        // the reservation itself remains the capacity linearization point.
+        if mpsc.capacity == usize::MAX {
+            let mut occupied = mpsc.occupied.load(AtomicOrdering::Acquire);
+            loop {
+                if occupied >= mpsc.capacity {
+                    return STATUS_FULL;
+                }
+                match mpsc.occupied.compare_exchange_weak(
+                    occupied,
+                    occupied + 1,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => occupied = actual,
+                }
             }
-            match mpsc.occupied.compare_exchange_weak(
-                occupied,
-                occupied + 1,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => occupied = actual,
+        } else {
+            let occupied = mpsc.occupied.fetch_add(1, AtomicOrdering::AcqRel);
+            if occupied >= mpsc.capacity {
+                mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
+                return STATUS_FULL;
             }
         }
 
-        let mut value = Vec::new();
-        if value.try_reserve_exact(data.len()).is_err() {
-            mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
-            return STATUS_INTERNAL_ERROR;
-        }
-        value.extend_from_slice(data);
-        let Ok(mut shard) = mpsc.shards[self.shard_id].lock() else {
+        let Ok(value) = Value::try_copy(data) else {
             mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
             return STATUS_INTERNAL_ERROR;
         };
-        if shard.heap.try_reserve(1).is_err() {
-            mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
-            return STATUS_INTERNAL_ERROR;
+        let shard_state = &mpsc.shards[self.shard_id];
+        let mut shard = shard_state.lock.lock();
+        if shard.heap.len() == shard.heap.capacity() {
+            if shard.heap.try_reserve(1).is_err() {
+                mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
+                return STATUS_INTERNAL_ERROR;
+            }
         }
         shard.heap.push(Entry { priority, value });
+        shard_state.min_priority.store(
+            shard.heap.peek().unwrap().priority,
+            AtomicOrdering::Release,
+        );
+        shard_state.has_item.store(true, AtomicOrdering::Release);
         STATUS_OK
     }
 }
@@ -217,38 +346,70 @@ impl Consumer {
         if entry.value.len() > output.len() {
             return Err(STATUS_INVALID);
         }
-        output[..entry.value.len()].copy_from_slice(&entry.value);
+        entry.value.copy_to(output);
         let length = entry.value.len();
         values.heap.pop();
         Ok(length)
     }
 
     fn try_dequeue_mpsc(&self, mpsc: &MpscState, output: &mut [u8]) -> Result<usize, u32> {
-        // Taking locks in shard order gives the consumer a consistent view;
-        // producers never hold more than their own shard lock.
-        let mut shards = Vec::with_capacity(mpsc.shards.len());
-        for shard in &mpsc.shards {
-            let Ok(shard) = shard.lock() else {
-                return Err(STATUS_INTERNAL_ERROR);
+        loop {
+            let mut best_index = None;
+            let mut best_priority = u64::MAX;
+            for (index, shard) in mpsc.shards.iter().enumerate() {
+                if !shard.has_item.load(AtomicOrdering::Acquire) {
+                    continue;
+                }
+                let priority = shard.min_priority.load(AtomicOrdering::Acquire);
+                if best_index.is_none() || priority < best_priority {
+                    best_index = Some(index);
+                    best_priority = priority;
+                }
+            }
+            let Some(best_index) = best_index else {
+                return Err(STATUS_EMPTY);
             };
-            shards.push(shard);
+
+            let shard_state = &mpsc.shards[best_index];
+            let mut shard = shard_state.lock.lock();
+            let Some(best) = shard.heap.peek() else {
+                shard_state.has_item.store(false, AtomicOrdering::Release);
+                shard_state
+                    .min_priority
+                    .store(u64::MAX, AtomicOrdering::Release);
+                continue;
+            };
+            let actual_priority = best.priority;
+            let mut another_lower = false;
+            for (index, other) in mpsc.shards.iter().enumerate() {
+                if index != best_index
+                    && other.has_item.load(AtomicOrdering::Acquire)
+                    && other.min_priority.load(AtomicOrdering::Acquire) < actual_priority
+                {
+                    another_lower = true;
+                    break;
+                }
+            }
+            if another_lower {
+                continue;
+            }
+            if best.value.len() > output.len() {
+                return Err(STATUS_INVALID);
+            }
+            let length = best.value.len();
+            best.value.copy_to(output);
+            shard.heap.pop();
+            if let Some(next) = shard.heap.peek() {
+                shard_state
+                    .min_priority
+                    .store(next.priority, AtomicOrdering::Release);
+                shard_state.has_item.store(true, AtomicOrdering::Release);
+            } else {
+                shard_state.has_item.store(false, AtomicOrdering::Release);
+            }
+            mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
+            return Ok(length);
         }
-        let Some((best_index, best)) = shards
-            .iter()
-            .enumerate()
-            .filter_map(|(index, shard)| shard.heap.peek().map(|entry| (index, entry)))
-            .min_by(|(_, left), (_, right)| left.priority.cmp(&right.priority))
-        else {
-            return Err(STATUS_EMPTY);
-        };
-        if best.value.len() > output.len() {
-            return Err(STATUS_INVALID);
-        }
-        output[..best.value.len()].copy_from_slice(&best.value);
-        let length = best.value.len();
-        shards[best_index].heap.pop();
-        mpsc.occupied.fetch_sub(1, AtomicOrdering::Release);
-        Ok(length)
     }
 }
 
@@ -314,5 +475,16 @@ mod tests {
                 .load(AtomicOrdering::Acquire),
             0
         );
+    }
+
+    #[test]
+    fn mpsc_accepts_maximum_priority() {
+        let queue = Queue::new(2, 1, 2, 1).unwrap();
+        let producer = queue.producer(0).unwrap();
+        let consumer = queue.consumer(0).unwrap();
+        assert_eq!(producer.try_enqueue(u64::MAX, &[7]), STATUS_OK);
+        let mut output = [0_u8; 1];
+        assert_eq!(consumer.try_dequeue(&mut output), Ok(1));
+        assert_eq!(output, [7]);
     }
 }
